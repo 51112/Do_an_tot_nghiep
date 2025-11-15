@@ -5,28 +5,37 @@ import cv2
 import tempfile
 import numpy as np
 from pytubefix import YouTube
+import yt_dlp
 from PIL import Image
 import time
 import os
+import threading
 from collections import defaultdict, deque
-from typing import List
 
-st.set_page_config(page_title="Traffic Monitoring (Detection + Tracking + Counting)", layout="wide")
-st.title("🚦 Traffic Monitoring — Detection · Tracking · Counting")
+st.set_page_config(page_title="Traffic Monitoring - Live & VOD", layout="wide")
+st.title("Traffic Monitoring — Detection · Tracking · Counting")
 
 # ---------------------------
-# Load model (local best.pt)
+# Load model
 # ---------------------------
 @st.cache_resource
 def load_model():
-    if not os.path.exists("best.pt"):
-        raise FileNotFoundError("Không tìm thấy best.pt trong repo! Hãy upload vào Github.")
-    return YOLO("best.pt")
+    model_path = "best.pt"
+    if not os.path.exists(model_path):
+        st.error("Không tìm thấy file mô hình `best.pt`! Upload vào root repo.")
+        return None
+    try:
+        return YOLO(model_path)
+    except Exception as e:
+        st.error(f"Lỗi load mô hình: {str(e)}")
+        return None
 
 model = load_model()
+if model is None:
+    st.stop()
 
 # ---------------------------
-# Simple tracker
+# Tracker
 # ---------------------------
 class Track:
     def __init__(self, tid, box, label, score):
@@ -61,19 +70,15 @@ class SimpleTracker:
     def update(self, dets):
         used = set()
         ids = list(self.tracks.keys())
-
-        # Match with IoU
         for tid in ids:
             t = self.tracks[tid]
-            best = -1
-            best_j = -1
+            best = -1; best_j = -1
             for j, det in enumerate(dets):
                 if j in used: continue
                 iou = self.iou(t.box, det["box"])
                 if iou > best:
                     best = iou
                     best_j = j
-
             if best >= self.iou_threshold:
                 det = dets[best_j]
                 t.box = det["box"]
@@ -85,8 +90,6 @@ class SimpleTracker:
                 self.seen_ids[t.label].add(t.id)
             else:
                 t.missed += 1
-
-        # Register new
         for j, det in enumerate(dets):
             if j not in used:
                 tid = self.next_id; self.next_id += 1
@@ -94,8 +97,6 @@ class SimpleTracker:
                 tr.history.append(tuple(tr.center()))
                 self.tracks[tid] = tr
                 self.seen_ids[tr.label].add(tid)
-
-        # Remove lost
         for tid in list(self.tracks.keys()):
             if self.tracks[tid].missed > self.max_missed:
                 del self.tracks[tid]
@@ -104,7 +105,7 @@ class SimpleTracker:
         return {k: len(v) for k,v in self.seen_ids.items()}
 
 # ---------------------------
-# Class filter
+# Detection & Draw
 # ---------------------------
 DEFAULT_CLASS_MAP = {0:"person",1:"bicycle",2:"car",3:"motorbike",5:"bus",7:"truck"}
 VEHICLES = {"car","motorbike","bus","truck","bicycle"}
@@ -129,94 +130,190 @@ def draw_tracks(frame, tracks):
     return frame
 
 # ---------------------------
-# Full pipeline
+# Real-time Processor (Upload & VOD)
 # ---------------------------
-def process_video(path, conf=0.25, skip=2):
+def process_video_realtime(path, conf=0.25, skip=2, placeholder_video=None, placeholder_count=None):
     cap = cv2.VideoCapture(path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 20
-    w = int(cap.get(3)); h = int(cap.get(4))
-
-    out_temp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    writer = cv2.VideoWriter(out_temp.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if not cap.isOpened():
+        if placeholder_video: placeholder_video.error("Không mở được video!")
+        return None
 
     tracker = SimpleTracker()
     frame_id = 0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    bar = st.progress(0)
+    fps_start = time.time()
+    processed = 0
 
     while True:
         ret, frame = cap.read()
         if not ret: break
         frame_id += 1
+        if frame_id % skip != 0: continue
 
-        if frame_id % skip != 0:
-            writer.write(frame)
-            continue
-
+        frame = cv2.resize(frame, (640, 640))
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         dets = yolo_detect(rgb, conf)
         tracker.update(dets)
-
         frame = draw_tracks(frame, tracker.tracks)
-        writer.write(frame)
 
-        if total:
-            bar.progress(frame_id / total)
+        processed += 1
+        if processed % 30 == 0:
+            fps = processed / (time.time() - fps_start + 1e-6)
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+
+        _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if placeholder_video:
+            placeholder_video.image(buffer.tobytes(), channels="BGR", use_column_width=True)
+        if placeholder_count:
+            placeholder_count.write(f"### Đang xử lý...\n**Đếm hiện tại**: {tracker.counts()}")
 
     cap.release()
-    writer.release()
-    return out_temp.name, tracker.counts()
+    return tracker.counts()
+
+# ---------------------------
+# YouTube Live Stream Processor
+# ---------------------------
+stop_event = threading.Event()
+
+def youtube_live_processor(video_id, conf=0.25, skip=2, placeholder_video=None, placeholder_count=None):
+    yt_path = None
+    try:
+        placeholder_count.info("Đang tải YouTube Live stream...")
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',
+            'outtmpl': 'live_yt.%(ext)s',
+            'quiet': True,
+            'noplaylist': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        yt_path = 'live_yt.mp4'
+        if not os.path.exists(yt_path):
+            raise Exception("Không tải được video Live!")
+
+        cap = cv2.VideoCapture(yt_path)
+        if not cap.isOpened():
+            placeholder_video.error("Không mở được video Live!")
+            return
+
+        tracker = SimpleTracker()
+        frame_id = 0
+        fps_start = time.time()
+        processed = 0
+
+        while not stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_id += 1
+            if frame_id % skip != 0: continue
+
+            frame = cv2.resize(frame, (640, 640))
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            dets = yolo_detect(rgb, conf)
+            tracker.update(dets)
+            frame = draw_tracks(frame, tracker.tracks)
+
+            processed += 1
+            if processed % 30 == 0:
+                fps = processed / (time.time() - fps_start + 1e-6)
+                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if placeholder_video:
+                placeholder_video.image(buffer.tobytes(), channels="BGR", use_column_width=True)
+            if placeholder_count:
+                placeholder_count.write(f"### YouTube Live\n**Đếm hiện tại**: {tracker.counts()}\n**Frame**: {frame_id}")
+
+        cap.release()
+        final = tracker.counts()
+        if placeholder_count:
+            placeholder_count.success(f"### Hoàn thành!\n**Tổng đếm**: {final}")
+
+    except Exception as e:
+        if placeholder_video:
+            placeholder_video.error(f"Lỗi: {str(e)}")
+    finally:
+        if yt_path and os.path.exists(yt_path):
+            os.remove(yt_path)
+        stop_event.clear()
 
 # ---------------------------
 # UI
 # ---------------------------
-st.sidebar.subheader("Settings")
+st.sidebar.subheader("Cài đặt")
 conf = st.sidebar.slider("Confidence threshold", 0.1, 0.9, 0.25)
-skip = st.sidebar.slider("Skip frames", 1, 8, 2)
+skip = st.sidebar.slider("Skip frames", 1, 5, 2)
 
-tab1, tab2 = st.tabs(["📤 Upload Video", "🔗 YouTube Link"])
+tab1, tab2, tab3 = st.tabs(["Upload Video", "YouTube Video", "YouTube Live"])
 
+# --- TAB 1: Upload ---
 with tab1:
     file = st.file_uploader("Upload video", type=["mp4","avi","mov"])
     if file:
-        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tmp.write(file.read())
+        tmp.close()
         st.video(tmp.name)
 
-        if st.button("Run detection + tracking"):
-            out, counts = process_video(tmp.name, conf, skip)
-            st.video(out)
-            st.write("### Counts:", counts)
+        if st.button("Run Detection"):
+            video_ph = st.empty()
+            count_ph = st.empty()
+            counts = process_video_realtime(tmp.name, conf, skip, video_ph, count_ph)
+            st.success("Hoàn thành!")
+            st.write("### Tổng đếm:", counts)
+            os.unlink(tmp.name)
 
-
-# Đầu file: Giữ nguyên import from pytubefix import YouTube
-# ... (code khác)
-
+# --- TAB 2: YouTube VOD ---
 with tab2:
-    url = st.text_input("YouTube Video URL")
+    url = st.text_input("YouTube Video URL (VOD)")
     if url and st.button("Process YouTube Video"):
-        yt_path = None
         try:
-            with st.spinner("Đang tải video từ YouTube..."):
-                # Sử dụng use_po_token=True để bypass bot detection
-                yt = YouTube(url, use_po_token=True)  # ← THÊM DÒNG NÀY
+            with st.spinner("Đang tải video..."):
+                yt = YouTube(url, use_po_token=True)
                 stream = yt.streams.filter(file_extension='mp4').order_by("resolution").first()
-                if stream is None:
-                    st.error("Không tìm thấy stream MP4 hợp lệ từ YouTube! Thử video khác.")
+                if not stream:
+                    st.error("Không tìm thấy stream MP4!")
                     st.stop()
                 yt_path = stream.download(filename="yt.mp4")
-            
-            out, counts = process_video(yt_path, conf, skip)
-            if out:
-                st.video(out)
-                st.write("### Counts:", counts)
-            
-            # Cleanup files
-            if yt_path and os.path.exists(yt_path):
-                os.remove(yt_path)
-            if out and os.path.exists(out):
-                os.remove(out)
-                
-        except Exception as e:
-            st.error(f"Lỗi download/processing YouTube: {str(e)}. Gợi ý: Thử video khác, hoặc dùng upload tab.")
 
+            video_ph = st.empty()
+            count_ph = st.empty()
+            counts = process_video_realtime(yt_path, conf, skip, video_ph, count_ph)
+            st.success("Hoàn thành!")
+            st.write("### Tổng đếm:", counts)
+            if os.path.exists(yt_path): os.remove(yt_path)
+        except Exception as e:
+            st.error(f"Lỗi: {e}")
+
+# --- TAB 3: YouTube Live ---
+with tab3:
+    st.subheader("YouTube Live Stream Detection")
+    st.info("Nhập **ID video Live** (phần sau `v=`). Ví dụ: `xCNRP131kNY`")
+
+    live_id = st.text_input("YouTube Live ID", placeholder="Ví dụ: xCNRP131kNY")
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        start_btn = st.button("Bắt đầu Live", type="primary")
+    with col2:
+        stop_btn = st.button("Dừng", type="secondary")
+
+    video_ph = st.empty()
+    count_ph = st.empty()
+
+    if start_btn:
+        if not live_id.strip():
+            st.error("Vui lòng nhập ID!")
+            st.stop()
+        stop_event.clear()
+        thread = threading.Thread(
+            target=youtube_live_processor,
+            args=(live_id, conf, skip, video_ph, count_ph),
+            daemon=True
+        )
+        thread.start()
+        st.success("Đã bắt đầu YouTube Live!")
+
+    if stop_btn:
+        stop_event.set()
+        st.warning("Đã dừng.")
