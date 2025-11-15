@@ -4,7 +4,7 @@ from ultralytics import YOLO
 import cv2
 import tempfile
 import numpy as np
-from pytube import YouTube
+from pytubefix import YouTube
 from PIL import Image
 import time
 import os
@@ -188,14 +188,25 @@ with tab1:
             st.video(out)
             st.write("### Counts:", counts)
 
+
 with tab2:
     url = st.text_input("YouTube Video URL")
     if url and st.button("Process YouTube Video"):
-        yt = YouTube(url)
-        stream = yt.streams.filter(file_extension='mp4').order_by("resolution").first()
-        yt_path = stream.download(filename="yt.mp4")
-        out, counts = process_video(yt_path, conf, skip)
-        st.video(out)
-        st.write("### Counts:", counts)
-
-
+        try:
+            with st.spinner("Đang tải video từ YouTube..."):
+                yt = YouTube(url)
+                stream = yt.streams.filter(file_extension='mp4').order_by("resolution").first()
+                if stream is None:
+                    st.error("Không tìm thấy stream MP4 hợp lệ từ YouTube! Thử video khác.")
+                    st.stop()
+                yt_path = stream.download(filename="yt.mp4")
+            
+            out, counts = process_video(yt_path, conf, skip)
+            if out:
+                st.video(out)
+                st.write("### Counts:", counts)
+            # Cleanup file
+            if os.path.exists(yt_path):
+                os.remove(yt_path)
+        except Exception as e:
+            st.error(f"Lỗi download/processing YouTube: {str(e)}. Thử video khác hoặc kiểm tra link.")
