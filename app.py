@@ -9,6 +9,7 @@ import time
 import os
 import threading
 import queue
+import subprocess
 from collections import defaultdict, deque
 
 # TẮT CẢNH BÁO
@@ -18,12 +19,12 @@ os.environ["YOLO_VERBOSE"] = "False"
 
 # === CẤU HÌNH TRANG ===
 st.set_page_config(page_title="Traffic Live Monitoring", layout="wide")
-st.title("Traffic Monitoring — Live Detection (15s/lần)")
+st.title("Traffic Monitoring — 15s/lần (Tự động)")
 
 # === 1. ĐỌC LABELMAP.TXT ===
 def load_label_map():
     if not os.path.exists("labelmap.txt"):
-        st.error("Không tìm thấy `labelmap.txt`! Upload vào root repo.")
+        st.error("Không tìm thấy `labelmap.txt`!")
         return {}, {}
     id_to_label, label_to_id = {}, {}
     with open("labelmap.txt", "r", encoding="utf-8") as f:
@@ -44,7 +45,6 @@ ID_TO_LABEL, LABEL_TO_ID = load_label_map()
 if not ID_TO_LABEL:
     st.stop()
 
-# Chỉ detect xe
 VEHICLE_LABELS = {"car", "motorbike", "bus", "truck"}
 VEHICLE_IDS = {LABEL_TO_ID[label] for label in VEHICLE_LABELS if label in LABEL_TO_ID}
 
@@ -52,7 +52,7 @@ VEHICLE_IDS = {LABEL_TO_ID[label] for label in VEHICLE_LABELS if label in LABEL_
 @st.cache_resource
 def load_model():
     if not os.path.exists("best.pt"):
-        st.error("Không tìm thấy `best.pt`! Upload vào root repo.")
+        st.error("Không tìm thấy `best.pt`!")
         return None
     return YOLO("best.pt")
 
@@ -134,34 +134,27 @@ def draw_tracks(frame, tracks):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
     return frame
 
-# === 5. XỬ LÝ 15s VIDEO (TỰ ĐỘNG LẶP) ===
-stop_event = threading.Event()
-message_queue = queue.Queue()
-current_temp_file = None
+# === 5. CẮT 15s VỚI FFMPEG ===
+def cut_15s_ffmpeg(input_path, output_path):
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-t", "15", "-c", "copy", output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0
 
-def clear_all():
-    global current_temp_file
-    stop_event.set()
-    if current_temp_file and os.path.exists(current_temp_file):
-        try: os.unlink(current_temp_file)
-        except: pass
-    current_temp_file = None
-
-def process_15s_segment(video_path, conf, skip, ph_video, ph_count, ph_live_video):
-    cap = cv2.VideoCapture(video_path)
+# === 6. XỬ LÝ 15s ===
+def process_15s_segment(segment_path, conf, skip, ph_video, ph_count):
+    cap = cv2.VideoCapture(segment_path)
     if not cap.isOpened():
-        message_queue.put(("status", "error", "Không mở được video!"))
-        return
+        return None
 
     tracker = SimpleTracker()
-    frame_id = 0
-    start_time = time.time()
-    processed = 0
+    frame_id = 0; processed = 0; start_time = time.time()
 
-    while not stop_event.is_set():
+    while cap.isOpened():
         ret, frame = cap.read()
-        if not ret or (time.time() - start_time > 15):  # Dừng sau 15s
-            break
+        if not ret: break
         frame_id += 1
         if frame_id % skip != 0: continue
 
@@ -183,71 +176,98 @@ def process_15s_segment(video_path, conf, skip, ph_video, ph_count, ph_live_vide
     cap.release()
     return tracker.counts()
 
-def youtube_live_cycle(video_id, conf, skip):
-    global current_temp_file
-    total_time = 0
-    max_duration = 180  # 3 phút = 180s
-    segment_duration = 15  # 15s mỗi lần
+# === 7. YOUTUBE LIVE CYCLE (15s/lần) ===
+stop_event = threading.Event()
+message_queue = queue.Queue()
+current_segment = None
+live_file = None
 
+def clear_all():
+    global current_segment, live_file
+    stop_event.set()
+    for f in [current_segment, live_file]:
+        if f and os.path.exists(f):
+            try: os.unlink(f)
+            except: pass
+    current_segment = live_file = None
+
+def youtube_live_cycle(video_id, conf, skip):
+    global current_segment, live_file
+    total_time = 0
+    max_duration = 180  # 3 phút
+
+    # TẢI LIVE (toàn bộ)
+    live_path = "live_stream.mp4"
+    ydl_opts = {
+        'format': 'worst[ext=mp4]',
+        'outtmpl': live_path,
+        'quiet': True, 'no_warnings': True,
+        'continuedl': True, 'wait_for_video': (10, 30),
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            if not info or not info.get('is_live'):
+                message_queue.put(("status", "error", "Không phải live stream!"))
+                return
+            message_queue.put(("status", "info", "Đang tải live stream..."))
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+    except Exception as e:
+        message_queue.put(("status", "error", f"Tải thất bại: {str(e)}"))
+        return
+
+    if not os.path.exists(live_path):
+        message_queue.put(("status", "error", "Không tải được stream!"))
+        return
+
+    live_file = live_path
+    message_queue.put(("status", "success", "Tải thành công! Bắt đầu xử lý 15s/lần..."))
+
+    # VÒNG LẶP 15s
     while total_time < max_duration and not stop_event.is_set():
         segment_start = time.time()
-        yt_path = "segment.mp4"
 
-        # TẢI 15s VIDEO
-        try:
-            ydl_opts = {
-                'format': 'worst[ext=mp4]',
-                'outtmpl': yt_path,
-                'quiet': True, 'no_warnings': True,
-                'download_ranges': lambda info, _: [{'start_time': 0, 'end_time': segment_duration}],
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-                if not info or not info.get('is_live'):
-                    message_queue.put(("status", "error", "Video không phải live!"))
-                    return
-                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-        except:
-            message_queue.put(("status", "error", "Tải đoạn video thất bại!"))
-            time.sleep(3)
-            continue
-
-        if not os.path.exists(yt_path):
-            time.sleep(3)
-            continue
-
-        # Tạo file tạm để hiển thị
+        # Tạo file tạm 15s
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tfile.close()
-        os.replace(yt_path, tfile.name)
-        current_temp_file = tfile.name
+        current_segment = tfile.name
+
+        if not cut_15s_ffmpeg(live_path, tfile.name):
+            message_queue.put(("status", "error", "Cắt video thất bại!"))
+            break
+
+        # Hiển thị video gốc
         message_queue.put(("video", tfile.name))
-        message_queue.put(("status", "info", f"Đang xử lý đoạn {int(total_time)}s - {int(total_time + 15)}s..."))
+        message_queue.put(("status", "info", f"Đoạn {int(total_time)}s - {int(total_time + 15)}s"))
 
-        # XỬ LÝ 15s
-        ph_v = st.empty()
-        ph_c = st.empty()
-        final_count = process_15s_segment(tfile.name, conf, skip, ph_v, ph_c, None)
+        # Xử lý
+        final_count = process_15s_segment(tfile.name, conf, skip, None, None)
 
-        # CLEAN
+        # Clean
         if os.path.exists(tfile.name):
             os.unlink(tfile.name)
-        current_temp_file = None
-        message_queue.put(("status", "success", f"Hoàn thành đoạn {int(total_time + 15)}s → Đếm: {final_count}"))
+        current_segment = None
+
+        if final_count:
+            message_queue.put(("status", "success", f"Đoạn hoàn thành → Đếm: {final_count}"))
 
         total_time += (time.time() - segment_start)
-        time.sleep(1)  # Nghỉ 1s trước đoạn tiếp theo
+        time.sleep(2)  # Nghỉ 2s
 
+    # Dọn dẹp
+    if os.path.exists(live_path):
+        os.unlink(live_path)
+    live_file = None
     message_queue.put(("status", "final", f"HOÀN TẤT! Tổng thời gian: {int(total_time)}s"))
 
-# === 6. GIAO DIỆN ===
+# === 8. GIAO DIỆN ===
 st.sidebar.header("Cài đặt")
 conf = st.sidebar.slider("Confidence", 0.1, 0.9, 0.25, 0.05)
 skip = st.sidebar.slider("Skip frames", 1, 5, 2)
 
 tab1, tab2 = st.tabs(["Upload Video", "YouTube Live (15s/lần)"])
 
-# --- TAB 1: Upload Video ---
 with tab1:
     st.subheader("Upload Video để Test")
     uploaded_file = st.file_uploader("Chọn video", type=["mp4", "avi", "mov"])
@@ -255,21 +275,18 @@ with tab1:
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tfile.write(uploaded_file.read()); tfile.close()
         st.video(tfile.name)
-
         if st.button("Bắt đầu Phát Hiện", type="primary"):
             ph_v = st.empty(); ph_c = st.empty()
-            with st.spinner("Đang xử lý..."):
-                process_15s_segment(tfile.name, conf, skip, ph_v, ph_c, None)
+            process_15s_segment(tfile.name, conf, skip, ph_v, ph_c)
             os.unlink(tfile.name)
             st.success("Hoàn tất!")
 
-# --- TAB 2: YouTube Live (TỰ ĐỘNG 15s) ---
 with tab2:
     st.subheader("YouTube Live — Tự động 15s/lần")
-    st.info("**Tự động chạy 15s → clean → lặp → dừng sau 3 phút**")
+    st.info("**Tự động: Tải → Cắt 15s → Xử lý → Clean → Lặp → Dừng sau 3 phút**")
 
     live_id = st.text_input("YouTube Live ID", placeholder="Ví dụ: xCNRP131kNY")
-    start_btn = st.button("Bắt đầu Live (3 phút)", type="primary")
+    start_btn = st.button("Bắt đầu (3 phút)", type="primary")
 
     ph_live_video = st.empty()
     ph_video = st.empty()
@@ -315,4 +332,4 @@ with tab2:
             daemon=True
         )
         st.session_state.live_thread.start()
-        st.success("Bắt đầu tự động 15s/lần...")
+        st.success("Bắt đầu xử lý 15s/lần...")
