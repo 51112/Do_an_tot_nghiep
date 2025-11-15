@@ -1,0 +1,5 @@
+0 person
+1 car
+2 motorbike
+3 bus
+4 truck
