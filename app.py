@@ -177,7 +177,7 @@ def youtube_live_processor(video_id, conf, skip, ph_video, ph_count):
                 time.sleep(0.5)
                 continue
             frame_id += 1
-            if frame_id Historical % skip != 0: continue
+            if frame_id % skip != 0: continue
             frame = cv2.resize(frame, (640, 640))
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             dets = yolo_detect(rgb, conf); tracker.update(dets); frame = draw_tracks(frame, tracker.tracks)
@@ -250,3 +250,4 @@ with tab2:
     if stop_btn:
         stop_event.set()
         st.warning("Đã dừng.")
+
