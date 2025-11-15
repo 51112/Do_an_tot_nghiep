@@ -11,6 +11,11 @@ import threading
 import queue
 from collections import defaultdict, deque
 
+# TẮT CẢNH BÁO
+os.environ["YOLO_CONFIG_DIR"] = "/tmp"
+os.environ["ULTRALYTICS_SETTINGS_DISABLE"] = "1"
+os.environ["YOLO_VERBOSE"] = "False"
+
 # === CẤU HÌNH TRANG ===
 st.set_page_config(page_title="Traffic Live Monitoring", layout="wide")
 st.title("Traffic Monitoring — Live Detection & Counting")
@@ -44,11 +49,11 @@ ID_TO_LABEL, LABEL_TO_ID = load_label_map()
 if not ID_TO_LABEL:
     st.stop()
 
-# Chỉ detect các loại xe
+# Chỉ detect xe
 VEHICLE_LABELS = {"car", "motorbike", "bus", "truck"}
 VEHICLE_IDS = {LABEL_TO_ID[label] for label in VEHICLE_LABELS if label in LABEL_TO_ID}
 
-# === 2. TẢI MODEL YOLO ===
+# === 2. TẢI MODEL ===
 @st.cache_resource
 def load_model():
     if not os.path.exists("best.pt"):
@@ -159,7 +164,7 @@ def draw_tracks(frame, tracks):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
     return frame
 
-# === 5. REAL-TIME PROCESSING (Upload) ===
+# === 5. UPLOAD VIDEO ===
 def process_upload_realtime(path, conf, skip, ph_video, ph_count):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -190,13 +195,14 @@ def process_upload_realtime(path, conf, skip, ph_video, ph_count):
             fps = processed / (time.time() - start_time + 1e-6)
             cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        ph_video.image(frame, channels="BGR", use_container_width=True)
+        _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        ph_video.image(buffer.tobytes(), channels="BGR", use_container_width=True)
         ph_count.write(f"**Đếm hiện tại**: {tracker.counts()}")
 
     cap.release()
     ph_count.success(f"**Tổng đếm**: {tracker.counts()}")
 
-# === 6. YOUTUBE LIVE PROCESSING (AN TOÀN VỚI QUEUE) ===
+# === 6. YOUTUBE LIVE ===
 stop_event = threading.Event()
 message_queue = queue.Queue()
 
@@ -258,8 +264,8 @@ def youtube_live_processor(video_id, conf, skip):
                 fps = processed / (time.time() - start_time + 1e-6)
                 cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-            # Gửi frame + count qua queue
-            message_queue.put(("frame", frame))
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            message_queue.put(("frame", buffer.tobytes()))
             message_queue.put(("count", f"**YouTube Live - Đếm hiện tại**: {tracker.counts()}\n**Frame**: {frame_id}"))
 
         cap.release()
@@ -279,7 +285,6 @@ skip = st.sidebar.slider("Skip frames", 1, 5, 2)
 
 tab1, tab2 = st.tabs(["Upload Video", "YouTube Live"])
 
-# --- TAB 1: Upload Video ---
 with tab1:
     st.subheader("Upload Video để Test")
     uploaded_file = st.file_uploader("Chọn video", type=["mp4", "avi", "mov"])
@@ -295,7 +300,6 @@ with tab1:
             process_upload_realtime(tfile.name, conf, skip, ph_v, ph_c)
             os.unlink(tfile.name)
 
-# --- TAB 2: YouTube Live ---
 with tab2:
     st.subheader("YouTube Live Stream")
     st.info("**Chỉ hoạt động với video đang LIVE** (có chữ đỏ 'LIVE').")
@@ -310,7 +314,7 @@ with tab2:
     ph_video = st.empty()
     ph_count = st.empty()
 
-    # Xử lý queue (chỉ trong main thread)
+    # Xử lý queue
     try:
         while True:
             msg = message_queue.get_nowait()
