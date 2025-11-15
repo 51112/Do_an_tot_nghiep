@@ -189,12 +189,17 @@ with tab1:
             st.write("### Counts:", counts)
 
 
+# Đầu file: Giữ nguyên import from pytubefix import YouTube
+# ... (code khác)
+
 with tab2:
     url = st.text_input("YouTube Video URL")
     if url and st.button("Process YouTube Video"):
+        yt_path = None
         try:
             with st.spinner("Đang tải video từ YouTube..."):
-                yt = YouTube(url)
+                # Sử dụng use_po_token=True để bypass bot detection
+                yt = YouTube(url, use_po_token=True)  # ← THÊM DÒNG NÀY
                 stream = yt.streams.filter(file_extension='mp4').order_by("resolution").first()
                 if stream is None:
                     st.error("Không tìm thấy stream MP4 hợp lệ từ YouTube! Thử video khác.")
@@ -205,8 +210,13 @@ with tab2:
             if out:
                 st.video(out)
                 st.write("### Counts:", counts)
-            # Cleanup file
-            if os.path.exists(yt_path):
+            
+            # Cleanup files
+            if yt_path and os.path.exists(yt_path):
                 os.remove(yt_path)
+            if out and os.path.exists(out):
+                os.remove(out)
+                
         except Exception as e:
-            st.error(f"Lỗi download/processing YouTube: {str(e)}. Thử video khác hoặc kiểm tra link.")
+            st.error(f"Lỗi download/processing YouTube: {str(e)}. Gợi ý: Thử video khác, hoặc dùng upload tab.")
+
