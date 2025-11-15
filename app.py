@@ -20,7 +20,7 @@ st.title("🚦 Traffic Monitoring — Detection · Tracking · Counting")
 @st.cache_resource
 def load_model():
     if not os.path.exists("best.pt"):
-        raise FileNotFoundError("Không tìm thấy best.pt trong repo! Hãy upload vào Hugging Face Space.")
+        raise FileNotFoundError("Không tìm thấy best.pt trong repo! Hãy upload vào Github.")
     return YOLO("best.pt")
 
 model = load_model()
@@ -197,4 +197,5 @@ with tab2:
         out, counts = process_video(yt_path, conf, skip)
         st.video(out)
         st.write("### Counts:", counts)
+
 
