@@ -1,4 +1,4 @@
-# streamlit_app.py
+# app.py
 import streamlit as st
 from ultralytics import YOLO
 import cv2
@@ -197,3 +197,4 @@ with tab2:
         out, counts = process_video(yt_path, conf, skip)
         st.video(out)
         st.write("### Counts:", counts)
+
