@@ -1,8 +1,7 @@
 streamlit
 ultralytics
 opencv-python-headless
-pytubefix
-yt-dlp  # Để tải YouTube Live
+yt-dlp
 numpy
 Pillow
 torch
