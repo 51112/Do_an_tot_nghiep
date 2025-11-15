@@ -8,6 +8,7 @@ import yt_dlp
 import time
 import os
 import threading
+import queue
 from collections import defaultdict, deque
 
 # === CẤU HÌNH TRANG ===
@@ -88,7 +89,8 @@ class SimpleTracker:
         inter = max(0, xB - xA) * max(0, yB - yA)
         areaA = (a[2] - a[0]) * (a[3] - a[1])
         areaB = (b[2] - b[0]) * (b[3] - b[1])
-        return inter / (areaA + areaB - inter + 1e-6) if (areaA + areaB - inter) > 0 else 0
+        union = areaA + areaB - inter
+        return inter / union if union > 0 else 0
 
     def update(self, dets):
         used = set()
@@ -198,13 +200,14 @@ def process_upload_realtime(path, conf, skip, ph_video, ph_count):
     cap.release()
     ph_count.success(f"**Tổng đếm**: {tracker.counts()}")
 
-# === 6. YOUTUBE LIVE PROCESSING ===
+# === 6. YOUTUBE LIVE PROCESSING (AN TOÀN VỚI QUEUE) ===
 stop_event = threading.Event()
+message_queue = queue.Queue()
 
-def youtube_live_processor(video_id, conf, skip, ph_video, ph_count):
+def youtube_live_processor(video_id, conf, skip):
     yt_path = "live_stream.mp4"
     try:
-        ph_count.info("Đang kết nối YouTube Live...")
+        message_queue.put(("info", "Đang kết nối YouTube Live..."))
 
         ydl_opts = {
             'format': 'worst[ext=mp4]',
@@ -219,24 +222,24 @@ def youtube_live_processor(video_id, conf, skip, ph_video, ph_count):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             if not info or not info.get('is_live'):
-                ph_video.error("Video này KHÔNG PHẢI live stream đang phát!")
+                message_queue.put(("error", "Video này KHÔNG PHẢI live stream đang phát!"))
                 return
             ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
 
         if not os.path.exists(yt_path):
-            ph_video.error("Không tải được stream!")
+            message_queue.put(("error", "Không tải được stream!"))
             return
 
         cap = cv2.VideoCapture(yt_path)
         if not cap.isOpened():
-            ph_video.error("Không mở được file stream!")
+            message_queue.put(("error", "Không mở được file stream!"))
             return
 
         tracker = SimpleTracker()
         frame_id = 0
         start_time = time.time()
         processed = 0
-        ph_count.success("Kết nối thành công! Đang xử lý live...")
+        message_queue.put(("success", "Kết nối thành công! Đang xử lý live..."))
 
         while not stop_event.is_set():
             ret, frame = cap.read()
@@ -260,14 +263,14 @@ def youtube_live_processor(video_id, conf, skip, ph_video, ph_count):
                 cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
             _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            ph_video.image(buffer.tobytes(), channels="BGR", use_column_width=True)
-            ph_count.write(f"**YouTube Live - Đếm hiện tại**: {tracker.counts()}\n**Frame**: {frame_id}")
+            message_queue.put(("image", buffer.tobytes()))
+            message_queue.put(("count", f"**YouTube Live - Đếm hiện tại**: {tracker.counts()}\n**Frame**: {frame_id}"))
 
         cap.release()
-        ph_count.success(f"**Tổng đếm**: {tracker.counts()}")
+        message_queue.put(("final", f"**Tổng đếm**: {tracker.counts()}"))
 
     except Exception as e:
-        ph_video.error(f"Lỗi: {str(e)}")
+        message_queue.put(("error", f"Lỗi: {str(e)}"))
     finally:
         if os.path.exists(yt_path):
             os.remove(yt_path)
@@ -311,20 +314,48 @@ with tab2:
     ph_video = st.empty()
     ph_count = st.empty()
 
+    # Xử lý message từ queue
+    try:
+        while True:
+            msg_type, msg_data = message_queue.get_nowait()
+            if msg_type == "image":
+                ph_video.image(msg_data, channels="BGR", use_column_width=True)
+            elif msg_type == "count":
+                ph_count.write(msg_data)
+            elif msg_type == "info":
+                ph_count.info(msg_data)
+            elif msg_type == "success":
+                ph_count.success(msg_data)
+            elif msg_type == "error":
+                ph_count.error(msg_data)
+            elif msg_type == "final":
+                ph_count.success(msg_data)
+    except queue.Empty:
+        pass
+
+    if 'live_thread' not in st.session_state:
+        st.session_state.live_thread = None
+
     if start_btn:
         id_val = live_id.strip()
         if not id_val:
             st.error("Vui lòng nhập ID video Live!")
             st.stop()
+        if st.session_state.live_thread and st.session_state.live_thread.is_alive():
+            st.warning("Đã có luồng đang chạy!")
+            st.stop()
+
         stop_event.clear()
-        thread = threading.Thread(
+        st.session_state.live_thread = threading.Thread(
             target=youtube_live_processor,
-            args=(id_val, conf, skip, ph_video, ph_count),
+            args=(id_val, conf, skip),
             daemon=True
         )
-        thread.start()
+        st.session_state.live_thread.start()
         st.success("Đang kết nối YouTube Live...")
 
     if stop_btn:
         stop_event.set()
+        if st.session_state.live_thread and st.session_state.live_thread.is_alive():
+            st.session_state.live_thread.join(timeout=1)
         st.warning("Đã dừng xử lý.")
