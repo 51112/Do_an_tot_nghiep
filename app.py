@@ -25,24 +25,19 @@ def load_label_map():
     if not os.path.exists("labelmap.txt"):
         st.error("Không tìm thấy `labelmap.txt`! Upload vào root repo.")
         return {}, {}
-    
-    id_to_label = {}
-    label_to_id = {}
+    id_to_label, label_to_id = {}, {}
     with open("labelmap.txt", "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line or " " not in line:
-                continue
+            if not line or " " not in line: continue
             parts = line.split(" ", 1)
-            if len(parts) != 2:
-                continue
+            if len(parts) != 2: continue
             try:
                 cid = int(parts[0])
                 label = parts[1].strip()
                 id_to_label[cid] = label
                 label_to_id[label.lower()] = cid
-            except:
-                continue
+            except: continue
     return id_to_label, label_to_id
 
 ID_TO_LABEL, LABEL_TO_ID = load_label_map()
@@ -68,24 +63,16 @@ if model is None:
 # === 3. TRACKING ===
 class Track:
     def __init__(self, tid, box, label, score):
-        self.id = tid
-        self.box = box
-        self.label = label
-        self.score = score
-        self.missed = 0
-        self.history = deque(maxlen=40)
-
+        self.id = tid; self.box = box; self.label = label; self.score = score
+        self.missed = 0; self.history = deque(maxlen=40)
     def center(self):
         x1, y1, x2, y2 = self.box
         return np.array([(x1 + x2) / 2, (y1 + y2) / 2])
 
 class SimpleTracker:
     def __init__(self, iou_threshold=0.3, max_missed=12):
-        self.next_id = 1
-        self.tracks = {}
-        self.iou_threshold = iou_threshold
-        self.max_missed = max_missed
-        self.seen_ids = defaultdict(set)
+        self.next_id = 1; self.tracks = {}; self.iou_threshold = iou_threshold
+        self.max_missed = max_missed; self.seen_ids = defaultdict(set)
 
     @staticmethod
     def iou(a, b):
@@ -94,55 +81,39 @@ class SimpleTracker:
         inter = max(0, xB - xA) * max(0, yB - yA)
         areaA = (a[2] - a[0]) * (a[3] - a[1])
         areaB = (b[2] - b[0]) * (b[3] - b[1])
-        union = areaA + areaB - inter
-        return inter / union if union > 0 else 0
+        return inter / (areaA + areaB - inter) if (areaA + areaB - inter) > 0 else 0
 
     def update(self, dets):
-        used = set()
-        ids = list(self.tracks.keys())
-
+        used = set(); ids = list(self.tracks.keys())
         for tid in ids:
-            t = self.tracks[tid]
-            best_iou = -1
-            best_j = -1
+            t = self.tracks[tid]; best_iou = -1; best_j = -1
             for j, det in enumerate(dets):
                 if j in used: continue
                 iou_val = self.iou(t.box, det["box"])
                 if iou_val > best_iou:
-                    best_iou = iou_val
-                    best_j = j
+                    best_iou = iou_val; best_j = j
             if best_iou >= self.iou_threshold:
                 det = dets[best_j]
-                t.box = det["box"]
-                t.label = det["label"]
-                t.score = det["score"]
-                t.history.append(tuple(t.center()))
-                t.missed = 0
-                used.add(best_j)
-                self.seen_ids[t.label].add(t.id)
+                t.box = det["box"]; t.label = det["label"]; t.score = det["score"]
+                t.history.append(tuple(t.center())); t.missed = 0
+                used.add(best_j); self.seen_ids[t.label].add(t.id)
             else:
                 t.missed += 1
-
         for j, det in enumerate(dets):
             if j not in used:
-                tid = self.next_id
-                self.next_id += 1
+                tid = self.next_id; self.next_id += 1
                 tr = Track(tid, det["box"], det["label"], det["score"])
-                tr.history.append(tuple(tr.center()))
-                self.tracks[tid] = tr
+                tr.history.append(tuple(tr.center())); self.tracks[tid] = tr
                 self.seen_ids[tr.label].add(tid)
-
         for tid in list(self.tracks.keys()):
             if self.tracks[tid].missed > self.max_missed:
                 del self.tracks[tid]
-
     def counts(self):
         return {k: len(v) for k, v in self.seen_ids.items()}
 
 # === 4. DETECTION & DRAW ===
 def yolo_detect(frame_rgb, conf):
-    if not VEHICLE_IDS:
-        return []
+    if not VEHICLE_IDS: return []
     results = model(frame_rgb, imgsz=640, conf=conf, verbose=False)[0]
     dets = []
     for box, score, cls in zip(
@@ -150,8 +121,7 @@ def yolo_detect(frame_rgb, conf):
         results.boxes.conf.cpu().numpy(),
         results.boxes.cls.cpu().numpy().astype(int)
     ):
-        if cls not in VEHICLE_IDS:
-            continue
+        if cls not in VEHICLE_IDS: continue
         label = ID_TO_LABEL.get(cls, f"class{cls}")
         dets.append({"box": box, "label": label, "score": float(score)})
     return dets
@@ -164,25 +134,20 @@ def draw_tracks(frame, tracks):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
     return frame
 
-# === 5. UPLOAD VIDEO ===
+# === 5. UPLOAD VIDEO (TỰ ĐỘNG DETECT) ===
 def process_upload_realtime(path, conf, skip, ph_video, ph_count):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        ph_video.error("Không mở được video!")
-        return
+        ph_video.error("Không mở được video!"); return
 
     tracker = SimpleTracker()
-    frame_id = 0
-    start_time = time.time()
-    processed = 0
+    frame_id = 0; start_time = time.time(); processed = 0
 
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
         frame_id += 1
-        if frame_id % skip != 0:
-            continue
+        if frame_id % skip != 0: continue
 
         frame = cv2.resize(frame, (640, 640))
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -197,16 +162,26 @@ def process_upload_realtime(path, conf, skip, ph_video, ph_count):
 
         _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         ph_video.image(buffer.tobytes(), channels="BGR", use_container_width=True)
-        ph_count.write(f"**Đếm hiện tại**: {tracker.counts()}")
+        ph_count.markdown(f"**Đếm hiện tại**: {tracker.counts()}")
 
     cap.release()
     ph_count.success(f"**Tổng đếm**: {tracker.counts()}")
 
-# === 6. YOUTUBE LIVE ===
+# === 6. YOUTUBE LIVE (TỰ ĐỘNG, HIỂN THỊ VIDEO NHƯ LOCAL) ===
 stop_event = threading.Event()
 message_queue = queue.Queue()
+live_temp_file = None  # Lưu file tạm
+
+def clear_live_data():
+    global live_temp_file
+    stop_event.set()
+    if live_temp_file and os.path.exists(live_temp_file):
+        try: os.unlink(live_temp_file)
+        except: pass
+    live_temp_file = None
 
 def youtube_live_processor(video_id, conf, skip):
+    global live_temp_file
     yt_path = "live_stream.mp4"
     try:
         message_queue.put(("status", "info", "Đang kết nối YouTube Live..."))
@@ -214,44 +189,45 @@ def youtube_live_processor(video_id, conf, skip):
         ydl_opts = {
             'format': 'worst[ext=mp4]',
             'outtmpl': yt_path,
-            'quiet': True,
-            'no_warnings': True,
-            'continuedl': True,
-            'wait_for_video': (10, 30),
+            'quiet': True, 'no_warnings': True,
+            'continuedl': True, 'wait_for_video': (10, 30),
             'live_from_start': True,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             if not info or not info.get('is_live'):
-                message_queue.put(("status", "error", "Video này KHÔNG PHẢI live stream đang phát!"))
+                message_queue.put(("status", "error", "Video không phải live!"))
                 return
             ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
 
         if not os.path.exists(yt_path):
-            message_queue.put(("status", "error", "Không tải được stream!"))
+            message_queue.put(("status", "error", "Tải stream thất bại!"))
             return
 
-        cap = cv2.VideoCapture(yt_path)
+        # Tạo file tạm để hiển thị video
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.close()
+        os.replace(yt_path, tfile.name)
+        live_temp_file = tfile.name
+        message_queue.put(("video", tfile.name))
+        message_queue.put(("status", "success", "Kết nối thành công!"))
+
+        cap = cv2.VideoCapture(tfile.name)
         if not cap.isOpened():
-            message_queue.put(("status", "error", "Không mở được file stream!"))
+            message_queue.put(("status", "error", "Không mở được stream!"))
             return
 
         tracker = SimpleTracker()
-        frame_id = 0
-        start_time = time.time()
-        processed = 0
-        message_queue.put(("status", "success", "Kết nối thành công! Đang xử lý live..."))
+        frame_id = 0; start_time = time.time(); processed = 0
 
         while not stop_event.is_set():
             ret, frame = cap.read()
             if not ret:
-                time.sleep(0.5)
-                continue
+                time.sleep(0.5); continue
 
             frame_id += 1
-            if frame_id % skip != 0:
-                continue
+            if frame_id % skip != 0: continue
 
             frame = cv2.resize(frame, (640, 640))
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -275,8 +251,8 @@ def youtube_live_processor(video_id, conf, skip):
         message_queue.put(("status", "error", f"Lỗi: {str(e)}"))
     finally:
         if os.path.exists(yt_path):
-            os.remove(yt_path)
-        stop_event.clear()
+            try: os.remove(yt_path)
+            except: pass
 
 # === 7. GIAO DIỆN ===
 st.sidebar.header("Cài đặt")
@@ -285,21 +261,23 @@ skip = st.sidebar.slider("Skip frames", 1, 5, 2)
 
 tab1, tab2 = st.tabs(["Upload Video", "YouTube Live"])
 
+# --- TAB 1: Upload Video ---
 with tab1:
     st.subheader("Upload Video để Test")
     uploaded_file = st.file_uploader("Chọn video", type=["mp4", "avi", "mov"])
     if uploaded_file:
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tfile.write(uploaded_file.read())
-        tfile.close()
+        tfile.write(uploaded_file.read()); tfile.close()
         st.video(tfile.name)
 
-        if st.button("Bắt đầu Phát Hiện"):
-            ph_v = st.empty()
-            ph_c = st.empty()
-            process_upload_realtime(tfile.name, conf, skip, ph_v, ph_c)
+        if st.button("Bắt đầu Phát Hiện", type="primary"):
+            ph_v = st.empty(); ph_c = st.empty()
+            with st.spinner("Đang xử lý video..."):
+                process_upload_realtime(tfile.name, conf, skip, ph_v, ph_c)
             os.unlink(tfile.name)
+            st.success("Hoàn tất!")
 
+# --- TAB 2: YouTube Live ---
 with tab2:
     st.subheader("YouTube Live Stream")
     st.info("**Chỉ hoạt động với video đang LIVE** (có chữ đỏ 'LIVE').")
@@ -313,26 +291,25 @@ with tab2:
 
     ph_video = st.empty()
     ph_count = st.empty()
+    ph_live_video = st.empty()  # Để hiển thị video gốc
 
     # Xử lý queue
     try:
         while True:
             msg = message_queue.get_nowait()
             msg_type = msg[0]
-            if msg_type == "frame":
+            if msg_type == "video":
+                ph_live_video.video(msg[1])
+            elif msg_type == "frame":
                 ph_video.image(msg[1], channels="BGR", use_container_width=True)
             elif msg_type == "count":
                 ph_count.markdown(msg[1])
             elif msg_type == "status":
                 status_type, text = msg[1], msg[2]
-                if status_type == "info":
-                    ph_count.info(text)
-                elif status_type == "success":
-                    ph_count.success(text)
-                elif status_type == "error":
-                    ph_count.error(text)
-                elif status_type == "final":
-                    ph_count.success(text)
+                if status_type == "info": ph_count.info(text)
+                elif status_type == "success": ph_count.success(text)
+                elif status_type == "error": ph_count.error(text)
+                elif status_type == "final": ph_count.success(text)
     except queue.Empty:
         pass
 
@@ -342,12 +319,11 @@ with tab2:
     if start_btn:
         id_val = live_id.strip()
         if not id_val:
-            st.error("Vui lòng nhập ID video Live!")
-            st.stop()
+            st.error("Nhập ID video!"); st.stop()
         if st.session_state.live_thread and st.session_state.live_thread.is_alive():
-            st.warning("Đã có luồng đang chạy!")
-            st.stop()
+            st.warning("Đang có luồng chạy!"); st.stop()
 
+        clear_live_data()
         stop_event.clear()
         st.session_state.live_thread = threading.Thread(
             target=youtube_live_processor,
@@ -355,10 +331,12 @@ with tab2:
             daemon=True
         )
         st.session_state.live_thread.start()
-        st.success("Đang kết nối YouTube Live...")
+        st.success("Đang kết nối...")
 
     if stop_btn:
-        stop_event.set()
+        clear_live_data()
         if st.session_state.live_thread and st.session_state.live_thread.is_alive():
             st.session_state.live_thread.join(timeout=1)
-        st.warning("Đã dừng xử lý.")
+        st.session_state.live_thread = None
+        ph_video.empty(); ph_count.empty(); ph_live_video.empty()
+        st.warning("Đã dừng và dọn dẹp!")
