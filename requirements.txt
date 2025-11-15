@@ -1,8 +1,9 @@
 streamlit
 ultralytics
 opencv-python-headless
-pytube
+pytubefix  # Thay pytube bằng pytubefix
 numpy
 Pillow
-huggingface-hub
+torch
+torchaudio
 ffmpeg-python
