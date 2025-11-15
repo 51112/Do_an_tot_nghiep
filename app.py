@@ -96,7 +96,6 @@ class SimpleTracker:
         used = set()
         ids = list(self.tracks.keys())
 
-        # Match existing tracks
         for tid in ids:
             t = self.tracks[tid]
             best_iou = -1
@@ -119,7 +118,6 @@ class SimpleTracker:
             else:
                 t.missed += 1
 
-        # Add new tracks
         for j, det in enumerate(dets):
             if j not in used:
                 tid = self.next_id
@@ -129,7 +127,6 @@ class SimpleTracker:
                 self.tracks[tid] = tr
                 self.seen_ids[tr.label].add(tid)
 
-        # Remove lost tracks
         for tid in list(self.tracks.keys()):
             if self.tracks[tid].missed > self.max_missed:
                 del self.tracks[tid]
@@ -193,8 +190,7 @@ def process_upload_realtime(path, conf, skip, ph_video, ph_count):
             fps = processed / (time.time() - start_time + 1e-6)
             cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        ph_video.image(buffer.tobytes(), channels="BGR", use_column_width=True)
+        ph_video.image(frame, channels="BGR", use_container_width=True)
         ph_count.write(f"**Đếm hiện tại**: {tracker.counts()}")
 
     cap.release()
@@ -207,7 +203,7 @@ message_queue = queue.Queue()
 def youtube_live_processor(video_id, conf, skip):
     yt_path = "live_stream.mp4"
     try:
-        message_queue.put(("info", "Đang kết nối YouTube Live..."))
+        message_queue.put(("status", "info", "Đang kết nối YouTube Live..."))
 
         ydl_opts = {
             'format': 'worst[ext=mp4]',
@@ -222,24 +218,24 @@ def youtube_live_processor(video_id, conf, skip):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             if not info or not info.get('is_live'):
-                message_queue.put(("error", "Video này KHÔNG PHẢI live stream đang phát!"))
+                message_queue.put(("status", "error", "Video này KHÔNG PHẢI live stream đang phát!"))
                 return
             ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
 
         if not os.path.exists(yt_path):
-            message_queue.put(("error", "Không tải được stream!"))
+            message_queue.put(("status", "error", "Không tải được stream!"))
             return
 
         cap = cv2.VideoCapture(yt_path)
         if not cap.isOpened():
-            message_queue.put(("error", "Không mở được file stream!"))
+            message_queue.put(("status", "error", "Không mở được file stream!"))
             return
 
         tracker = SimpleTracker()
         frame_id = 0
         start_time = time.time()
         processed = 0
-        message_queue.put(("success", "Kết nối thành công! Đang xử lý live..."))
+        message_queue.put(("status", "success", "Kết nối thành công! Đang xử lý live..."))
 
         while not stop_event.is_set():
             ret, frame = cap.read()
@@ -262,15 +258,15 @@ def youtube_live_processor(video_id, conf, skip):
                 fps = processed / (time.time() - start_time + 1e-6)
                 cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            message_queue.put(("image", buffer.tobytes()))
+            # Gửi frame + count qua queue
+            message_queue.put(("frame", frame))
             message_queue.put(("count", f"**YouTube Live - Đếm hiện tại**: {tracker.counts()}\n**Frame**: {frame_id}"))
 
         cap.release()
-        message_queue.put(("final", f"**Tổng đếm**: {tracker.counts()}"))
+        message_queue.put(("status", "final", f"**Tổng đếm**: {tracker.counts()}"))
 
     except Exception as e:
-        message_queue.put(("error", f"Lỗi: {str(e)}"))
+        message_queue.put(("status", "error", f"Lỗi: {str(e)}"))
     finally:
         if os.path.exists(yt_path):
             os.remove(yt_path)
@@ -314,22 +310,25 @@ with tab2:
     ph_video = st.empty()
     ph_count = st.empty()
 
-    # Xử lý message từ queue
+    # Xử lý queue (chỉ trong main thread)
     try:
         while True:
-            msg_type, msg_data = message_queue.get_nowait()
-            if msg_type == "image":
-                ph_video.image(msg_data, channels="BGR", use_column_width=True)
+            msg = message_queue.get_nowait()
+            msg_type = msg[0]
+            if msg_type == "frame":
+                ph_video.image(msg[1], channels="BGR", use_container_width=True)
             elif msg_type == "count":
-                ph_count.write(msg_data)
-            elif msg_type == "info":
-                ph_count.info(msg_data)
-            elif msg_type == "success":
-                ph_count.success(msg_data)
-            elif msg_type == "error":
-                ph_count.error(msg_data)
-            elif msg_type == "final":
-                ph_count.success(msg_data)
+                ph_count.markdown(msg[1])
+            elif msg_type == "status":
+                status_type, text = msg[1], msg[2]
+                if status_type == "info":
+                    ph_count.info(text)
+                elif status_type == "success":
+                    ph_count.success(text)
+                elif status_type == "error":
+                    ph_count.error(text)
+                elif status_type == "final":
+                    ph_count.success(text)
     except queue.Empty:
         pass
 
