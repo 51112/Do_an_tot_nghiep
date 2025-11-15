@@ -10,12 +10,44 @@ import os
 import threading
 from collections import defaultdict, deque
 
+# === CẤU HÌNH TRANG ===
 st.set_page_config(page_title="Traffic Live Monitoring", layout="wide")
 st.title("Traffic Monitoring — Live Detection & Counting")
 
-# ---------------------------
-# Load model
-# ---------------------------
+# === 1. ĐỌC LABELMAP.TXT ===
+def load_label_map():
+    if not os.path.exists("labelmap.txt"):
+        st.error("Không tìm thấy `labelmap.txt`! Upload vào root repo.")
+        return {}, {}
+    
+    id_to_label = {}
+    label_to_id = {}
+    with open("labelmap.txt", "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or " " not in line:
+                continue
+            parts = line.split(" ", 1)
+            if len(parts) != 2:
+                continue
+            try:
+                cid = int(parts[0])
+                label = parts[1].strip()
+                id_to_label[cid] = label
+                label_to_id[label.lower()] = cid
+            except:
+                continue
+    return id_to_label, label_to_id
+
+ID_TO_LABEL, LABEL_TO_ID = load_label_map()
+if not ID_TO_LABEL:
+    st.stop()
+
+# Chỉ detect các loại xe
+VEHICLE_LABELS = {"car", "motorbike", "bus", "truck"}
+VEHICLE_IDS = {LABEL_TO_ID[label] for label in VEHICLE_LABELS if label in LABEL_TO_ID}
+
+# === 2. TẢI MODEL YOLO ===
 @st.cache_resource
 def load_model():
     if not os.path.exists("best.pt"):
@@ -27,114 +59,146 @@ model = load_model()
 if model is None:
     st.stop()
 
-# ---------------------------
-# Tracker
-# ---------------------------
+# === 3. TRACKING ===
 class Track:
     def __init__(self, tid, box, label, score):
-        self.id = tid; self.box = box; self.label = label; self.score = score
-        self.missed = 0; self.history = deque(maxlen=40)
+        self.id = tid
+        self.box = box
+        self.label = label
+        self.score = score
+        self.missed = 0
+        self.history = deque(maxlen=40)
+
     def center(self):
-        x1,y1,x2,y2 = self.box
-        return np.array([(x1+x2)/2, (y1+y2)/2])
+        x1, y1, x2, y2 = self.box
+        return np.array([(x1 + x2) / 2, (y1 + y2) / 2])
 
 class SimpleTracker:
     def __init__(self, iou_threshold=0.3, max_missed=12):
-        self.next_id = 1; self.tracks = {}; self.iou_threshold = iou_threshold
-        self.max_missed = max_missed; self.seen_ids = defaultdict(set)
+        self.next_id = 1
+        self.tracks = {}
+        self.iou_threshold = iou_threshold
+        self.max_missed = max_missed
+        self.seen_ids = defaultdict(set)
 
     @staticmethod
     def iou(a, b):
         xA = max(a[0], b[0]); yA = max(a[1], b[1])
         xB = min(a[2], b[2]); yB = min(a[3], b[3])
-        inter = max(0, xB-xA) * max(0, yB-yA)
-        areaA = max(0,(a[2]-a[0])) * max(0,(a[3]-a[1]))
-        areaB = max(0,(b[2]-b[0])) * max(0,(b[3]-b[1]))
-        return inter / (areaA + areaB - inter + 1e-6)
+        inter = max(0, xB - xA) * max(0, yB - yA)
+        areaA = (a[2] - a[0]) * (a[3] - a[1])
+        areaB = (b[2] - b[0]) * (b[3] - b[1])
+        return inter / (areaA + areaB - inter + 1e-6) if (areaA + areaB - inter) > 0 else 0
 
     def update(self, dets):
-        used = set(); ids = list(self.tracks.keys())
+        used = set()
+        ids = list(self.tracks.keys())
+
+        # Match existing tracks
         for tid in ids:
-            t = self.tracks[tid]; best = -1; best_j = -1
+            t = self.tracks[tid]
+            best_iou = -1
+            best_j = -1
             for j, det in enumerate(dets):
                 if j in used: continue
                 iou_val = self.iou(t.box, det["box"])
-                if iou_val > best:
-                    best = iou_val; best_j = j
-            if best >= self.iou_threshold:
+                if iou_val > best_iou:
+                    best_iou = iou_val
+                    best_j = j
+            if best_iou >= self.iou_threshold:
                 det = dets[best_j]
-                t.box = det["box"]; t.label = det["label"]; t.score = det["score"]
-                t.history.append(tuple(t.center())); t.missed = 0
-                used.add(best_j); self.seen_ids[t.label].add(t.id)
+                t.box = det["box"]
+                t.label = det["label"]
+                t.score = det["score"]
+                t.history.append(tuple(t.center()))
+                t.missed = 0
+                used.add(best_j)
+                self.seen_ids[t.label].add(t.id)
             else:
                 t.missed += 1
+
+        # Add new tracks
         for j, det in enumerate(dets):
             if j not in used:
-                tid = self.next_id; self.next_id += 1
+                tid = self.next_id
+                self.next_id += 1
                 tr = Track(tid, det["box"], det["label"], det["score"])
                 tr.history.append(tuple(tr.center()))
-                self.tracks[tid] = tr; self.seen_ids[tr.label].add(tid)
+                self.tracks[tid] = tr
+                self.seen_ids[tr.label].add(tid)
+
+        # Remove lost tracks
         for tid in list(self.tracks.keys()):
             if self.tracks[tid].missed > self.max_missed:
                 del self.tracks[tid]
+
     def counts(self):
-        return {k: len(v) for k,v in self.seen_ids.items()}
+        return {k: len(v) for k, v in self.seen_ids.items()}
 
-# ---------------------------
-# Detection & Draw
-# ---------------------------
-VEHICLES = {"car","motorbike","bus","truck","bicycle"}
-DEFAULT_CLASS_MAP = {0:"person",1:"bicycle",2:"car",3:"motorbike",5:"bus",7:"truck"}
-
+# === 4. DETECTION & DRAW ===
 def yolo_detect(frame_rgb, conf):
-    res = model(frame_rgb, imgsz=640, conf=conf, verbose=False)[0]
+    if not VEHICLE_IDS:
+        return []
+    results = model(frame_rgb, imgsz=640, conf=conf, verbose=False)[0]
     dets = []
-    for box,score,cls in zip(res.boxes.xyxy.cpu().numpy(),
-                             res.boxes.conf.cpu().numpy(),
-                             res.boxes.cls.cpu().numpy().astype(int)):
-        label = DEFAULT_CLASS_MAP.get(cls, f"class{cls}")
-        if label in VEHICLES:
-            dets.append({"box": box, "label": label, "score": float(score)})
+    for box, score, cls in zip(
+        results.boxes.xyxy.cpu().numpy(),
+        results.boxes.conf.cpu().numpy(),
+        results.boxes.cls.cpu().numpy().astype(int)
+    ):
+        if cls not in VEHICLE_IDS:
+            continue
+        label = ID_TO_LABEL.get(cls, f"class{cls}")
+        dets.append({"box": box, "label": label, "score": float(score)})
     return dets
 
 def draw_tracks(frame, tracks):
     for t in tracks.values():
-        x1,y1,x2,y2 = t.box.astype(int)
-        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-        cv2.putText(frame, f"{t.label} ID:{t.id}", (x1, y1-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2)
+        x1, y1, x2, y2 = t.box.astype(int)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, f"{t.label} ID:{t.id}", (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
     return frame
 
-# ---------------------------
-# Real-time Processor (Upload)
-# ---------------------------
+# === 5. REAL-TIME PROCESSING (Upload) ===
 def process_upload_realtime(path, conf, skip, ph_video, ph_count):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         ph_video.error("Không mở được video!")
         return
-    tracker = SimpleTracker(); frame_id = 0; start = time.time(); proc = 0
+
+    tracker = SimpleTracker()
+    frame_id = 0
+    start_time = time.time()
+    processed = 0
+
     while True:
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            break
         frame_id += 1
-        if frame_id % skip != 0: continue
+        if frame_id % skip != 0:
+            continue
+
         frame = cv2.resize(frame, (640, 640))
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        dets = yolo_detect(rgb, conf); tracker.update(dets); frame = draw_tracks(frame, tracker.tracks)
-        proc += 1
-        if proc % 30 == 0:
-            fps = proc / (time.time() - start + 1e-6)
-            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-        _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        ph_video.image(buf.tobytes(), channels="BGR", use_column_width=True)
+        dets = yolo_detect(rgb, conf)
+        tracker.update(dets)
+        frame = draw_tracks(frame, tracker.tracks)
+
+        processed += 1
+        if processed % 30 == 0:
+            fps = processed / (time.time() - start_time + 1e-6)
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        ph_video.image(buffer.tobytes(), channels="BGR", use_column_width=True)
         ph_count.write(f"**Đếm hiện tại**: {tracker.counts()}")
+
     cap.release()
     ph_count.success(f"**Tổng đếm**: {tracker.counts()}")
 
-# ---------------------------
-# YouTube Live Processor (CHỈ DÙNG yt-dlp + HLS)
-# ---------------------------
+# === 6. YOUTUBE LIVE PROCESSING ===
 stop_event = threading.Event()
 
 def youtube_live_processor(video_id, conf, skip, ph_video, ph_count):
@@ -143,19 +207,19 @@ def youtube_live_processor(video_id, conf, skip, ph_video, ph_count):
         ph_count.info("Đang kết nối YouTube Live...")
 
         ydl_opts = {
-            'format': 'worst[ext=mp4]',  # Dùng worst để load nhanh, tránh lỗi
+            'format': 'worst[ext=mp4]',
             'outtmpl': yt_path,
             'quiet': True,
             'no_warnings': True,
             'continuedl': True,
-            'wait_for_video': (10, 30),  # Chờ 10-30s nếu chưa có stream
+            'wait_for_video': (10, 30),
             'live_from_start': True,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            if not info.get('is_live'):
-                ph_video.error("Video này KHÔNG PHẢI live stream! Vui lòng dùng video đang phát trực tiếp.")
+            if not info or not info.get('is_live'):
+                ph_video.error("Video này KHÔNG PHẢI live stream đang phát!")
                 return
             ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
 
@@ -168,7 +232,10 @@ def youtube_live_processor(video_id, conf, skip, ph_video, ph_count):
             ph_video.error("Không mở được file stream!")
             return
 
-        tracker = SimpleTracker(); frame_id = 0; start = time.time(); proc = 0
+        tracker = SimpleTracker()
+        frame_id = 0
+        start_time = time.time()
+        processed = 0
         ph_count.success("Kết nối thành công! Đang xử lý live...")
 
         while not stop_event.is_set():
@@ -176,17 +243,24 @@ def youtube_live_processor(video_id, conf, skip, ph_video, ph_count):
             if not ret:
                 time.sleep(0.5)
                 continue
+
             frame_id += 1
-            if frame_id % skip != 0: continue
+            if frame_id % skip != 0:
+                continue
+
             frame = cv2.resize(frame, (640, 640))
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            dets = yolo_detect(rgb, conf); tracker.update(dets); frame = draw_tracks(frame, tracker.tracks)
-            proc += 1
-            if proc % 30 == 0:
-                fps = proc / (time.time() - start + 1e-6)
-                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-            _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            ph_video.image(buf.tobytes(), channels="BGR", use_column_width=True)
+            dets = yolo_detect(rgb, conf)
+            tracker.update(dets)
+            frame = draw_tracks(frame, tracker.tracks)
+
+            processed += 1
+            if processed % 30 == 0:
+                fps = processed / (time.time() - start_time + 1e-6)
+                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            ph_video.image(buffer.tobytes(), channels="BGR", use_column_width=True)
             ph_count.write(f"**YouTube Live - Đếm hiện tại**: {tracker.counts()}\n**Frame**: {frame_id}")
 
         cap.release()
@@ -195,36 +269,39 @@ def youtube_live_processor(video_id, conf, skip, ph_video, ph_count):
     except Exception as e:
         ph_video.error(f"Lỗi: {str(e)}")
     finally:
-        if os.path.exists(yt_path): os.remove(yt_path)
+        if os.path.exists(yt_path):
+            os.remove(yt_path)
         stop_event.clear()
 
-# ---------------------------
-# UI
-# ---------------------------
-st.sidebar.subheader("Cài đặt")
-conf = st.sidebar.slider("Confidence", 0.1, 0.9, 0.25)
+# === 7. GIAO DIỆN ===
+st.sidebar.header("Cài đặt")
+conf = st.sidebar.slider("Confidence", 0.1, 0.9, 0.25, 0.05)
 skip = st.sidebar.slider("Skip frames", 1, 5, 2)
 
 tab1, tab2 = st.tabs(["Upload Video", "YouTube Live"])
 
-# --- TAB 1: Upload ---
+# --- TAB 1: Upload Video ---
 with tab1:
-    file = st.file_uploader("Upload video", type=["mp4","avi","mov"])
-    if file:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tmp.write(file.read()); tmp.close()
-        st.video(tmp.name)
-        if st.button("Run Detection"):
-            ph_v = st.empty(); ph_c = st.empty()
-            process_upload_realtime(tmp.name, conf, skip, ph_v, ph_c)
-            os.unlink(tmp.name)
+    st.subheader("Upload Video để Test")
+    uploaded_file = st.file_uploader("Chọn video", type=["mp4", "avi", "mov"])
+    if uploaded_file:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(uploaded_file.read())
+        tfile.close()
+        st.video(tfile.name)
+
+        if st.button("Bắt đầu Phát Hiện"):
+            ph_v = st.empty()
+            ph_c = st.empty()
+            process_upload_realtime(tfile.name, conf, skip, ph_v, ph_c)
+            os.unlink(tfile.name)
 
 # --- TAB 2: YouTube Live ---
 with tab2:
     st.subheader("YouTube Live Stream")
-    st.info("Chỉ dùng với **video đang LIVE**. Ví dụ: `xCNRP131kNY` (nếu đang phát).")
+    st.info("**Chỉ hoạt động với video đang LIVE** (có chữ đỏ 'LIVE').")
 
-    live_id = st.text_input("YouTube Live ID", placeholder="xCNRP131kNY")
+    live_id = st.text_input("YouTube Live ID", placeholder="Ví dụ: xCNRP131kNY")
     col1, col2 = st.columns([1, 3])
     with col1:
         start_btn = st.button("Bắt đầu Live", type="primary")
@@ -235,19 +312,19 @@ with tab2:
     ph_count = st.empty()
 
     if start_btn:
-        if not live_id.strip():
-            st.error("Nhập ID!")
+        id_val = live_id.strip()
+        if not id_val:
+            st.error("Vui lòng nhập ID video Live!")
             st.stop()
         stop_event.clear()
         thread = threading.Thread(
             target=youtube_live_processor,
-            args=(live_id, conf, skip, ph_video, ph_count),
+            args=(id_val, conf, skip, ph_video, ph_count),
             daemon=True
         )
         thread.start()
-        st.success("Đang kết nối...")
+        st.success("Đang kết nối YouTube Live...")
 
     if stop_btn:
         stop_event.set()
-        st.warning("Đã dừng.")
-
+        st.warning("Đã dừng xử lý.")
