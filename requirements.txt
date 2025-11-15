@@ -1,0 +1,8 @@
+streamlit
+ultralytics
+opencv-python-headless
+pytube
+numpy
+Pillow
+huggingface-hub
+ffmpeg-python
